@@ -23,6 +23,7 @@ function useLoad(url) {
   return [data, load, error]
 }
 
+const greet = () => { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening' }
 const money = (n) => '₹' + Number(n).toLocaleString('en-IN')
 const dash = (v) => (v === null || v === undefined || v === '' ? '—' : v)
 
@@ -44,7 +45,16 @@ function Table({ cols, rows, onRowClick }) {
 const col = (label, key, render) => ({ label, key, render })
 const badge = (k) => (r) => <span className={`badge ${r[k]}`}>{r[k]}</span>
 
-function Msg({ m }) { return m ? <p className={m.ok ? 'ok' : 'err'}>{m.text}</p> : null }
+function Msg({ m }) {
+  const [show, setShow] = useState(false)
+  useEffect(() => {
+    if (!m) return
+    setShow(true)
+    const t = setTimeout(() => setShow(false), 4000)
+    return () => clearTimeout(t)
+  }, [m])
+  return m && show ? <div className={`toast ${m.ok ? 'ok' : 'err'}`} role="status">{m.ok ? '✓' : '✕'} {m.text}</div> : null
+}
 
 function Page({ title, error, ready, children }) {
   return (
@@ -85,6 +95,8 @@ function Dashboard() {
   return (
     <Page title="Dashboard" error={error} ready={d}>
       {d && <>
+        <div className="hero"><div><h3>{greet()}, Doctor</h3><p>{new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}</p></div>
+          <div className="hero-n"><b>{c.today}</b>appointments today</div></div>
         {d.lowStock.length > 0 && <div className="alert">Low stock: {d.lowStock.map((m) => `${m.med_name} (${m.stock_qty})`).join(', ')}</div>}
         <div className="stats">{stats.map(([l, v, col]) => <div className="card stat" style={{ borderTopColor: col }} key={l}><b>{v}</b>{l}</div>)}</div>
         <div className="grid2">
@@ -132,7 +144,7 @@ function Patients() {
           <button className="btn">Add patient</button>
         </form><Msg m={m} /></div>
       <div className="card"><label>Search<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Name or phone" /></label></div>
-      <div className="card">{rows && <Table onRowClick={open} rows={rows} cols={[col('ID', 'patient_id'), col('Name', 'full_name'), col('Gender', 'gender'), col('Blood group', 'blood_group'), col('Phone', 'phone')]} />}</div>
+      <div className="card">{rows && <Table onRowClick={open} rows={rows} cols={[col('ID', 'patient_id'), col('Name', 'full_name', (r) => <span className="who"><i className="av">{r.full_name[0]}</i>{r.full_name}</span>), col('Gender', 'gender'), col('Blood group', 'blood_group'), col('Phone', 'phone')]} />}</div>
       {sel && <div className="card"><h3>Visit history: {sel.full_name}</h3>
         <Table rows={hist} cols={[col('Date', 'appt_date'), col('Doctor', 'doctor'), col('Department', 'dept_name'), col('Diagnosis', 'diagnosis')]} /></div>}
     </Page>
@@ -273,16 +285,27 @@ function Visits() {
 
 const tabs = { Dashboard, Patients, Appointments, Visits, Billing, Medicines }
 
+const ICON = { Dashboard: '📊', Patients: '🧑', Appointments: '📅', Visits: '🩺', Billing: '💳', Medicines: '💊' }
+
 export default function App() {
   const [tab, setTab] = useState('Dashboard')
+  const [dark, setDark] = useState(false)
+  useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light' }, [dark])
   const View = tabs[tab]
   return (
     <div className="layout">
       <nav>
-        <h1>MediTrack</h1>
-        {Object.keys(tabs).map((t) => <button key={t} className={t === tab ? 'on' : ''} onClick={() => setTab(t)}>{t}</button>)}
+        <h1><span className="logo">✚</span> MediTrack</h1>
+        {Object.keys(tabs).map((t) => (
+          <button key={t} className={t === tab ? 'on' : ''} onClick={() => setTab(t)}><span>{ICON[t]}</span>{t}</button>
+        ))}
+        <small>Healthcare record system</small>
       </nav>
-      <main><View key={tab} /></main>
+      <div className="content">
+        <div className="topbar"><span>Hospital management</span>
+          <button className="ghost" onClick={() => setDark(!dark)}>{dark ? '☀️ Light' : '🌙 Dark'}</button></div>
+        <main><View key={tab} /></main>
+      </div>
     </div>
   )
 }
