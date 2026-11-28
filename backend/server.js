@@ -156,7 +156,7 @@ app.get('/api/visits/:id', h(async (req, res) => {
   const id = req.params.id;
   res.json({
     history: await q('SELECT diagnosis, symptoms FROM medical_history WHERE appt_id = ?', [id]),
-    tests: await q(`SELECT t.test_name, o.status, t.price FROM test_order o
+    tests: await q(`SELECT o.order_id, t.test_name, o.status, o.result, t.price FROM test_order o
       JOIN diagnostic_test t ON t.test_id = o.test_id WHERE o.appt_id = ?`, [id]),
     meds: await q(`SELECT m.med_name, pi.dosage, pi.frequency, pi.quantity FROM prescription pr
       JOIN prescription_item pi ON pi.presc_id = pr.presc_id
@@ -188,6 +188,114 @@ app.post('/api/visits/:id/prescribe', h(async (req, res) => {
   await q(`INSERT INTO prescription_item (presc_id, med_id, dosage, frequency, duration_days, quantity)
            VALUES (?,?,?,?,?,?)`, [p.presc_id, med_id, dosage || null, frequency || null, duration_days || null, quantity]);
   res.status(201).json({ message: 'Medicine prescribed' });
+}));
+
+// ---- complete patient record (efficient retrieval: one patient, everything linked) ----
+app.get('/api/patients/:id/profile', h(async (req, res) => {
+  const id = req.params.id;
+  const [patient] = await q('SELECT * FROM patient WHERE patient_id = ?', [id]);
+  if (!patient) return res.status(404).json({ error: 'Patient not found' });
+  res.json({
+    patient,
+    history: await q(`SELECT a.appt_date, d.full_name AS doctor, dep.dept_name, mh.symptoms, mh.diagnosis
+      FROM medical_history mh JOIN appointment a ON a.appt_id = mh.appt_id
+      JOIN doctor d ON d.doctor_id = a.doctor_id JOIN department dep ON dep.dept_id = d.dept_id
+      WHERE mh.patient_id = ? ORDER BY a.appt_date DESC`, [id]),
+    tests: await q(`SELECT a.appt_date, t.test_name, o.status, o.result FROM test_order o
+      JOIN appointment a ON a.appt_id = o.appt_id JOIN diagnostic_test t ON t.test_id = o.test_id
+      WHERE a.patient_id = ? ORDER BY a.appt_date DESC`, [id]),
+    meds: await q(`SELECT a.appt_date, m.med_name, pi.dosage, pi.frequency, pi.duration_days, pi.quantity
+      FROM prescription pr JOIN appointment a ON a.appt_id = pr.appt_id
+      JOIN prescription_item pi ON pi.presc_id = pr.presc_id JOIN medicine m ON m.med_id = pi.med_id
+      WHERE a.patient_id = ? ORDER BY a.appt_date DESC`, [id]),
+    bills: await q(`SELECT b.bill_id, b.bill_date, b.total_amount, b.status FROM bill b
+      JOIN appointment a ON a.appt_id = b.appt_id WHERE a.patient_id = ? ORDER BY b.bill_id DESC`, [id]),
+  });
+}));
+
+// the audit trigger (trg_patient_audit) records every update made here
+app.put('/api/patients/:id', h(async (req, res) => {
+  const { full_name, phone, blood_group, address } = req.body;
+  if (!full_name || !/^\d{10}$/.test(phone || '')) return res.status(400).json({ error: 'Name and a 10-digit phone are required' });
+  await q('UPDATE patient SET full_name = ?, phone = ?, blood_group = ?, address = ? WHERE patient_id = ?',
+    [full_name.trim(), phone, blood_group || null, address || null, req.params.id]);
+  res.json({ message: 'Patient record updated' });
+}));
+
+app.patch('/api/tests/:id/result', h(async (req, res) => {
+  if (!req.body.result) return res.status(400).json({ error: 'Result is required' });
+  await q("UPDATE test_order SET result = ?, status = 'Completed', result_date = CURDATE() WHERE order_id = ?", [req.body.result, req.params.id]);
+  res.json({ message: 'Result saved' });
+}));
+
+// invoice: bill header, line items (bill_item) and payments
+app.get('/api/bills/:id', h(async (req, res) => {
+  const id = req.params.id;
+  const [bill] = await q(`SELECT b.bill_id, b.bill_date, b.total_amount, b.status, p.full_name AS patient
+    FROM bill b JOIN appointment a ON a.appt_id = b.appt_id JOIN patient p ON p.patient_id = a.patient_id
+    WHERE b.bill_id = ?`, [id]);
+  if (!bill) return res.status(404).json({ error: 'Bill not found' });
+  res.json({ bill,
+    items: await q('SELECT description, amount FROM bill_item WHERE bill_id = ?', [id]),
+    payments: await q('SELECT amount, method, paid_on FROM payment WHERE bill_id = ? ORDER BY paid_on', [id]) });
+}));
+
+// department-wise reports (same SQL as the report views and queries in the SQL scripts)
+app.get('/api/reports', h(async (req, res) => {
+  res.json({
+    appts: await q('SELECT * FROM v_dept_appointment_report'),
+    revenue: await q('SELECT * FROM v_dept_revenue_monthly'),
+    ranking: await q(`SELECT dep.dept_name, d.full_name AS doctor, SUM(b.total_amount) AS revenue,
+        RANK() OVER (PARTITION BY dep.dept_id ORDER BY SUM(b.total_amount) DESC) AS dept_rank
+      FROM bill b JOIN appointment a ON a.appt_id = b.appt_id JOIN doctor d ON d.doctor_id = a.doctor_id
+      JOIN department dep ON dep.dept_id = d.dept_id GROUP BY dep.dept_id, dep.dept_name, d.doctor_id, d.full_name`),
+    topDx: await q(`SELECT dep.dept_name, mh.diagnosis, COUNT(*) AS cases FROM medical_history mh
+      JOIN appointment a ON a.appt_id = mh.appt_id JOIN doctor d ON d.doctor_id = a.doctor_id
+      JOIN department dep ON dep.dept_id = d.dept_id GROUP BY dep.dept_name, mh.diagnosis ORDER BY dep.dept_name, cases DESC`),
+    tests: await q(`SELECT dep.dept_name, t.test_name, COUNT(*) AS orders FROM test_order o
+      JOIN diagnostic_test t ON t.test_id = o.test_id JOIN appointment a ON a.appt_id = o.appt_id
+      JOIN doctor d ON d.doctor_id = a.doctor_id JOIN department dep ON dep.dept_id = d.dept_id
+      GROUP BY dep.dept_name, t.test_name ORDER BY dep.dept_name, orders DESC`),
+    dues: await q(`SELECT p.full_name AS patient, b.bill_id, b.total_amount,
+        b.total_amount - COALESCE(SUM(pay.amount), 0) AS balance_due
+      FROM bill b JOIN appointment a ON a.appt_id = b.appt_id JOIN patient p ON p.patient_id = a.patient_id
+      LEFT JOIN payment pay ON pay.bill_id = b.bill_id WHERE b.status <> 'Paid'
+      GROUP BY b.bill_id, p.full_name, b.total_amount`),
+    audit: await q('SELECT table_name, action, record_id, changed_by, changed_at FROM audit_log ORDER BY log_id DESC LIMIT 10'),
+  });
+}));
+
+// ---- doctors and availability (appointment tracking) ----
+app.get('/api/doctors/overview', h(async (req, res) => {
+  res.json(await q(`SELECT d.doctor_id, d.full_name, dep.dept_name, d.specialization, d.consultation_fee,
+      COUNT(a.appt_id) AS total_appts, COALESCE(SUM(a.appt_date = CURDATE()), 0) AS today_appts
+    FROM doctor d JOIN department dep ON dep.dept_id = d.dept_id
+    LEFT JOIN appointment a ON a.doctor_id = d.doctor_id
+    GROUP BY d.doctor_id, d.full_name, dep.dept_name, d.specialization, d.consultation_fee ORDER BY dep.dept_name`));
+}));
+
+app.get('/api/doctors/:id/slots', h(async (req, res) => {
+  res.json(await q(`SELECT TIME_FORMAT(a.appt_time, '%H:%i') AS t, p.full_name AS patient
+    FROM appointment a JOIN patient p ON p.patient_id = a.patient_id
+    WHERE a.doctor_id = ? AND a.appt_date = ? AND a.status IN ('Scheduled', 'Completed')`, [req.params.id, req.query.date]));
+}));
+
+// ---- pharmacy stock for prescriptions ----
+app.patch('/api/medicines/:id/restock', h(async (req, res) => {
+  const qty = Number(req.body.qty);
+  if (!(qty > 0)) return res.status(400).json({ error: 'Quantity must be positive' });
+  await q('UPDATE medicine SET stock_qty = stock_qty + ? WHERE med_id = ?', [qty, req.params.id]);
+  res.json({ message: 'Stock updated' });
+}));
+
+// ---- optimization: EXPLAIN of the doctor-schedule query with and without an index ----
+app.get('/api/explain', h(async (req, res) => {
+  const pick = (rows) => rows.map((r) => ({ type: r.type, key: r.key || 'none', rows: r.rows, extra: r.Extra }));
+  const where = 'WHERE doctor_id = 1 AND appt_date = CURDATE() ORDER BY appt_time';
+  res.json({
+    noIndex: pick(await q(`EXPLAIN SELECT appt_time, patient_id, status FROM appointment USE INDEX () ${where}`)),
+    withIndex: pick(await q(`EXPLAIN SELECT appt_time, patient_id, status FROM appointment FORCE INDEX (idx_appt_doctor_date) ${where}`)),
+  });
 }));
 
 const port = process.env.PORT || 5000;
